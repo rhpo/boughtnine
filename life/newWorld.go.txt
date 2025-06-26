@@ -1,0 +1,784 @@
+package life
+
+import (
+	"fmt"
+	"image/color"
+	"math"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/ByteArena/box2d"
+	"github.com/hajimehoshi/ebiten/v2"
+	"github.com/hajimehoshi/ebiten/v2/inpututil"
+)
+
+type ContactListener struct {
+	box2d.B2ContactListenerInterface
+	world *World
+}
+
+func (cl *ContactListener) PreSolve(contact box2d.B2ContactInterface, oldManifold box2d.B2Manifold) {
+	// No-op, required by Box2D interface (No-op = no-operation)
+}
+
+func (cl *ContactListener) PostSolve(contact box2d.B2ContactInterface, impulse *box2d.B2ContactImpulse) {
+	// No-op, required by Box2D interface
+}
+
+func (cl *ContactListener) BeginContact(contact box2d.B2ContactInterface) {
+	cl.world.mutex.Lock() //  Lock the world mutex to ensure thread safety
+	defer cl.world.mutex.Unlock()
+
+	// Handle contact begin
+	fixtureA := contact.GetFixtureA()
+	fixtureB := contact.GetFixtureB()
+
+	if fixtureA == nil || fixtureB == nil {
+		return
+	}
+
+	bodyA := fixtureA.GetBody()
+	bodyB := fixtureB.GetBody()
+
+	// get from the world's objects, the bodies that are involved in the contact
+	var shapeA, shapeB *Shape
+	for _, obj := range cl.world.Objects {
+		if obj.Body == bodyA {
+			shapeA = obj
+		} else if obj.Body == bodyB {
+			shapeB = obj
+		}
+	}
+
+	if shapeA == nil || shapeB == nil {
+		return
+	}
+
+	// Emit collision event
+	cl.world.Emit(EventCollision, EventCollisionData{
+		ShapeA: shapeA,
+		ShapeB: shapeB,
+	})
+
+	shapeA.CollideWith(shapeB)
+	shapeB.CollideWith(shapeA)
+
+	if shapeA.OnCollisionFunc != nil {
+		shapeA.OnCollisionFunc(shapeB)
+	}
+
+	if shapeB.OnCollisionFunc != nil {
+		shapeB.OnCollisionFunc(shapeA)
+	}
+}
+
+func (cl *ContactListener) EndContact(contact box2d.B2ContactInterface) {
+	cl.world.mutex.Lock() // Lock the world mutex to ensure thread safety
+	defer cl.world.mutex.Unlock()
+
+	// Handle contact end
+	fixtureA := contact.GetFixtureA()
+	fixtureB := contact.GetFixtureB()
+
+	if fixtureA == nil || fixtureB == nil {
+		return
+	}
+
+	bodyA := fixtureA.GetBody()
+	bodyB := fixtureB.GetBody()
+
+	// get from the world's objects, the bodies that are involved in the contact
+	var shapeA, shapeB *Shape
+	for _, obj := range cl.world.Objects {
+		if obj.Body == bodyA {
+			shapeA = obj
+		} else if obj.Body == bodyB {
+			shapeB = obj
+		}
+	}
+
+	if shapeA == nil || shapeB == nil {
+		return
+	}
+
+	// Emit collision end event
+	cl.world.Emit("collision-end", map[string]interface{}{
+		"shapeA": shapeA,
+		"shapeB": shapeB,
+	})
+
+	shapeA.FinishCollideWith(shapeB)
+	shapeB.FinishCollideWith(shapeA)
+
+}
+
+// World represents the game world
+type World struct {
+	*EventEmitter
+
+	// Display properties
+	Width  int
+	Height int
+
+	// Physics
+	PhysicsWorld    *box2d.B2World
+	contactListener *ContactListener
+	G               Vector2 // Gravity
+	AirResistance   float64 // Air resistance for physics bodies
+
+	Screen *ebiten.Image // Screen to draw on
+
+	Tick       GameLoop
+	Init       func()
+	Render     func(screen *ebiten.Image)
+	Title      string
+	lastUpdate time.Time
+
+	// Visual properties
+	Pattern    PatternType
+	Background color.Color
+	Border     *Border
+
+	// Game objects
+	Objects []*Shape
+	mutex   sync.RWMutex
+
+	// Input
+	Mouse struct {
+		X, Y                          float64
+		IsLeftClicked, IsRightClicked bool
+		IsMiddleClicked               bool
+	}
+	Keys      map[ebiten.Key]bool
+	keysMutex sync.RWMutex // Add mutex for keys map
+
+	// State
+	HasLimits bool
+	Paused    bool
+	Cursor    CursorType
+
+	// Callbacks
+	OnMouseDown func(x, y float64)
+	OnMouseUp   func(x, y float64)
+	OnMouseMove func(x, y float64)
+
+	Levels       []Level
+	CurrentLevel int // Current level index
+}
+
+// WorldProps contains properties for creating a world
+type WorldProps struct {
+	Width         int
+	Height        int
+	G             Vector2
+	Pattern       PatternType
+	Background    color.Color
+	HasLimits     bool
+	Border        *Border
+	Paused        bool
+	Cursor        CursorType
+	Title         string
+	AirResistance float64 // Air resistance for physics bodies
+
+	Levels       []Level
+	CurrentLevel int
+}
+
+// NewWorld creates a new world
+func NewWorld(props *WorldProps) *World {
+	if props == nil {
+		props = &WorldProps{}
+	}
+
+	// Set defaults
+	if props.Width == 0 {
+		props.Width = 800
+	}
+	if props.Height == 0 {
+		props.Height = 600
+	}
+	if props.Background == nil {
+		props.Background = color.RGBA{0, 0, 0, 255}
+	}
+	if props.Pattern == "" {
+		props.Pattern = PatternColor
+	}
+	if props.Cursor == "" {
+		props.Cursor = CursorDefault
+	}
+	if props.Title == "" {
+		props.Title = "Life Game"
+	}
+
+	// Create Box2D world
+	contactListener := ContactListener{}
+
+	gravity := box2d.MakeB2Vec2(MetersToPixels(props.G.X), MetersToPixels(props.G.Y))
+
+	physicsWorld := box2d.MakeB2World(gravity)
+	physicsWorld.SetAllowSleeping(true)
+
+	physicsWorld.SetContactListener(&contactListener)
+
+	world := &World{
+		EventEmitter:    NewEventEmitter(),
+		contactListener: &contactListener,
+		PhysicsWorld:    &physicsWorld,
+		Width:           props.Width,
+		Height:          props.Height,
+		G:               props.G,
+		Tick:            nil, // Set later
+		Pattern:         props.Pattern,
+		Background:      props.Background,
+		Border:          props.Border,
+		Paused:          props.Paused,
+		Cursor:          props.Cursor,
+		Keys:            make(map[ebiten.Key]bool),
+		lastUpdate:      time.Now(),
+		Title:           props.Title,
+		AirResistance:   props.AirResistance,
+		Levels:          props.Levels,
+		CurrentLevel:    0,
+		Render:          func(screen *ebiten.Image) {},
+		Init:            func() {}, // Default init function
+	}
+
+	if len(world.Levels) == 0 {
+		world.Levels = []Level{
+			{
+				Map:      Map{},
+				MapItems: MapItems{},
+
+				Init: func(world *World) {
+					world.Init()
+				},
+				Tick:   world.Tick,
+				Render: world.Render,
+			},
+		}
+	}
+
+	contactListener.world = world
+
+	return world
+}
+
+func (w *World) Destroy() {
+	// Destroy all objects
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+
+	for _, obj := range w.Objects {
+		if obj.Body != nil {
+			w.PhysicsWorld.DestroyBody(obj.Body)
+		}
+	}
+
+	w.Objects = nil
+
+	// Clear the contact listener
+	w.contactListener.world = nil
+	w.contactListener = nil
+
+	// Clear the physics world
+	w.PhysicsWorld = nil
+}
+
+func (w *World) SelectLevel(index int) {
+
+	if index < 0 || index >= len(w.Levels) {
+		return
+	}
+
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+
+	w.CurrentLevel = index
+	level := w.Levels[index]
+
+	fmt.Printf("World objects: %d, Level: %d\n", len(w.Objects), index)
+
+	// Generate level from map
+	if level.Init != nil {
+		level.Init(w)
+	}
+
+	// Clear existing objects if level is not first one
+	if index > 0 {
+		for _, obj := range w.Objects {
+			if obj.Body != nil {
+				w.PhysicsWorld.DestroyBody(obj.Body)
+			}
+		}
+
+		w.Objects = nil
+		w.GenerateLevelFromMap(level.Map, level.MapItems)
+	}
+
+	if level.Tick != nil {
+		w.Tick = level.Tick
+	} else {
+		w.Tick = nil // Reset to nil if no tick function is provided
+	}
+
+	if level.Render != nil {
+		w.Render = level.Render
+	} else {
+		w.Render = nil // Reset to nil if no render function is provided
+	}
+}
+
+func (w *World) CreateBorders() {
+	borderWidth := 10.0 // Default border width in meters
+	if w.Border != nil && w.Border.Width > 0 {
+		borderWidth = w.Border.Width
+	}
+
+	var borderColor color.Color = color.RGBA{0, 0, 0, 255}
+	if w.Border != nil && w.Border.Background != nil {
+		borderColor = w.Border.Background
+	}
+
+	// Top border - static physics body
+	topBorder := NewShape(&ShapeProps{
+		Type:       ShapeRectangle,
+		X:          0,
+		Y:          0,
+		Width:      float64(w.Width),
+		Height:     borderWidth,
+		Background: borderColor,
+		Tag:        "border",
+		Name:       "borderX",
+		Physics:    true,
+		IsBody:     true,
+	})
+
+	// Bottom border - static physics body
+	bottomBorder := NewShape(&ShapeProps{
+		Type:       ShapeRectangle,
+		X:          0,
+		Y:          float64(w.Height) - borderWidth,
+		Width:      float64(w.Width),
+		Height:     borderWidth,
+		Background: borderColor,
+		Tag:        "border",
+		Name:       "borderXW",
+		Physics:    true,
+		IsBody:     true,
+	})
+
+	// Left border - static physics body
+	leftBorder := NewShape(&ShapeProps{
+		Type:       ShapeRectangle,
+		X:          0,
+		Y:          0,
+		Width:      borderWidth,
+		Height:     float64(w.Height),
+		Background: borderColor,
+		Tag:        "border",
+		Name:       "borderY",
+		Physics:    true,
+		IsBody:     true,
+	})
+
+	// Right border - static physics body
+	rightBorder := NewShape(&ShapeProps{
+		Type:       ShapeRectangle,
+		X:          float64(w.Width) - borderWidth,
+		Y:          0,
+		Width:      borderWidth,
+		Height:     float64(w.Height),
+		Background: borderColor,
+		Tag:        "border",
+		Name:       "borderYW",
+		Physics:    true,
+		IsBody:     true,
+	})
+
+	w.Register(topBorder)
+	w.Register(bottomBorder)
+	w.Register(leftBorder)
+	w.Register(rightBorder)
+}
+
+// Register adds an object to the world
+func (w *World) Register(object *Shape) {
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+
+	object.world = w
+	w.Objects = append(w.Objects, object)
+
+	w.createPhysicsBody(object)
+}
+
+// Unregister removes an object from the world
+func (w *World) Unregister(object *Shape) {
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+
+	for i, obj := range w.Objects {
+		if obj.ID == object.ID {
+			// Destroy Box2D body if it exists
+			if obj.Body != nil {
+				w.PhysicsWorld.DestroyBody(obj.Body)
+			}
+
+			w.Objects = append(w.Objects[:i], w.Objects[i+1:]...)
+			break
+		}
+	}
+}
+
+func (w *World) createPhysicsBody(object *Shape) {
+	// Create body definition
+	bodyDef := box2d.MakeB2BodyDef()
+
+	if !object.IsBody || object.Tag == "border" {
+		bodyDef.Type = box2d.B2BodyType.B2_staticBody // Static bodies for borders
+	} else {
+		bodyDef.Type = box2d.B2BodyType.B2_dynamicBody // Dynamic bodies for other objects
+	}
+
+	if !object.Physics {
+		bodyDef.GravityScale = 0
+	}
+
+	bodyDef.FixedRotation = object.RotationLock
+
+	centerX := object.X + object.Width/2
+	centerY := object.Y + object.Height/2
+	bodyDef.Position.Set(PixelsToMeters(centerX), PixelsToMeters(centerY))
+
+	body := w.PhysicsWorld.CreateBody(&bodyDef)
+
+	body.SetMassData(&box2d.B2MassData{
+		Mass: object.Mass,
+	})
+
+	var shape box2d.B2ShapeInterface
+	switch object.Type {
+	case ShapeCircle:
+		circleShape := box2d.MakeB2CircleShape()
+		circleShape.SetRadius(PixelsToMeters(object.Radius)) // Convert radius to meters
+		shape = &circleShape
+	default: // Rectangle
+		boxShape := box2d.MakeB2PolygonShape()
+		// Set box shape dimensions based on object width and height
+		if object.Width <= 0 || object.Height <= 0 {
+			panic("Width and Height must be greater than 0 for rectangle shapes")
+		}
+
+		boxShape.SetAsBox(PixelsToMeters(object.Width/2), PixelsToMeters(object.Height/2))
+		shape = &boxShape
+	}
+
+	// Create fixture with shape and density
+	density := 0.0
+	if !object.Physics {
+		density = 1.0 // Static bodies should have 1 density
+	}
+
+	fixture := body.CreateFixture(shape, density)
+
+	// Set additional properties
+	fixture.SetFriction(object.Friction)
+	fixture.SetRestitution(object.Rebound)
+
+	object.Body = body
+}
+
+func (w *World) GenerateLevelFromMap(levelMap Map, objects map[string]func(position Vector2, width, height float64)) {
+	// Implementation of GenerateLevelFromMap ===
+	// calculate tile size based on world dimensions and level map size
+	if len(levelMap) == 0 {
+		return
+	}
+	rows := len(levelMap)
+	cols := len(levelMap[0])
+	tileWidth := float64(w.Width / cols)
+	tileHeight := float64(w.Height / rows)
+
+	for y, row := range levelMap {
+		for x, ch := range row {
+			fn, ok := objects[string(ch)]
+			if !ok {
+				continue
+			}
+			pos := Vector2{
+				X: float64(x) * tileWidth,
+				Y: float64(y) * tileHeight,
+			}
+			fn(pos, tileWidth, tileHeight)
+		}
+	}
+}
+
+// Update updates the world state
+func (w *World) Update() error {
+	if w.Paused {
+		return nil
+	}
+
+	// Calculate deltaTime
+	now := time.Now()
+	var deltaTime float64
+	if !w.lastUpdate.IsZero() {
+		deltaTime = now.Sub(w.lastUpdate).Seconds()
+	} else {
+		deltaTime = 1.0 / 60.0 // default on first frame
+	}
+	w.lastUpdate = now
+
+	// Step physics simulation with real deltaTime
+	velocityIterations := 6
+	positionIterations := 3
+	w.PhysicsWorld.Step(deltaTime, velocityIterations, positionIterations)
+
+	for _, obj := range w.Objects {
+		obj.Update()
+	}
+
+	if w.Tick != nil {
+		w.Tick(LoopData{
+			Time:  now,
+			Delta: deltaTime,
+		})
+	}
+
+	// Update input
+	w.updateInput()
+
+	return nil
+}
+
+func (w *World) updateInput() {
+	// Update mouse position
+	x, y := ebiten.CursorPosition()
+	w.Mouse.X = float64(x)
+	w.Mouse.Y = float64(y)
+
+	// Update mouse buttons
+	w.Mouse.IsLeftClicked = ebiten.IsMouseButtonPressed(ebiten.MouseButtonLeft)
+	w.Mouse.IsRightClicked = ebiten.IsMouseButtonPressed(ebiten.MouseButtonRight)
+	w.Mouse.IsMiddleClicked = ebiten.IsMouseButtonPressed(ebiten.MouseButtonMiddle)
+
+	// Update keyboard with proper synchronization
+	w.keysMutex.Lock()
+	for key := ebiten.Key(0); key <= ebiten.KeyMax; key++ {
+		w.Keys[key] = ebiten.IsKeyPressed(key)
+	}
+	w.keysMutex.Unlock()
+
+	// Handle mouse events
+	if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) {
+		w.handleMouseDown(w.Mouse.X, w.Mouse.Y)
+	}
+	if inpututil.IsMouseButtonJustReleased(ebiten.MouseButtonLeft) {
+		w.handleMouseUp(w.Mouse.X, w.Mouse.Y)
+	}
+}
+
+func (w *World) handleMouseDown(x, y float64) {
+	hoveredObjects := w.HoveredObjects()
+	for _, obj := range hoveredObjects {
+		if !obj.Clicked {
+			obj.Clicked = true
+			obj.Emit(EventMouseDown, map[string]float64{"x": x, "y": y})
+		}
+	}
+
+	if w.OnMouseDown != nil {
+		w.OnMouseDown(x, y)
+	}
+}
+
+func (w *World) handleMouseUp(x, y float64) {
+	hoveredObjects := w.HoveredObjects()
+	for _, obj := range hoveredObjects {
+		obj.Emit(EventMouseUp, map[string]float64{"x": x, "y": y})
+		obj.Emit(EventClick, map[string]float64{"x": x, "y": y})
+		if obj.Clicked {
+			obj.Clicked = false
+		}
+	}
+
+	if w.OnMouseUp != nil {
+		w.OnMouseUp(x, y)
+	}
+}
+
+// Draw renders the world
+func (w *World) Draw(screen *ebiten.Image) {
+
+	if w.Screen != screen {
+		w.Screen = screen
+	}
+
+	// Clear screen with background
+	screen.Fill(w.Background)
+
+	// Sort objects by Z-index
+	w.mutex.RLock()
+	objects := make([]*Shape, len(w.Objects))
+	copy(objects, w.Objects)
+	w.mutex.RUnlock()
+
+	sort.Slice(objects, func(i, j int) bool {
+		if objects[i].Tag == "border" && objects[j].Tag != "border" {
+			return true
+		}
+		if objects[i].Tag != "border" && objects[j].Tag == "border" {
+			return false
+		}
+		return objects[i].ZIndex < objects[j].ZIndex
+	})
+
+	// Draw all objects
+	for _, obj := range objects {
+		obj.Draw(screen)
+	}
+}
+
+// Utility methods
+func (w *World) Center(obj *Shape, resetVelocity bool) {
+	obj.SetX(float64(w.Width)/2 - obj.Width/2)
+	obj.SetY(float64(w.Height)/2 - obj.Height/2)
+
+	if resetVelocity {
+		obj.SetVelocity(0, 0)
+	}
+}
+
+func (w *World) CenterX(obj *Shape, resetVelocity bool) {
+	obj.SetX(float64(w.Width)/2 - obj.Width/2)
+	if resetVelocity {
+		obj.SetVelocity(0, 0)
+	}
+}
+
+func (w *World) CenterY(obj *Shape, resetVelocity bool) {
+	obj.SetY(float64(w.Height)/2 - obj.Height/2)
+	if resetVelocity {
+		obj.SetVelocity(0, 0)
+	}
+}
+
+func (w *World) GetAngleBetween(a, b *Shape) float64 {
+	return math.Atan2(b.Y-a.Y, b.X-a.X) * 180 / math.Pi
+}
+
+func (w *World) HoveredObjects() []*Shape {
+	w.mutex.RLock()
+	defer w.mutex.RUnlock()
+
+	var hovered []*Shape
+	for _, obj := range w.Objects {
+		if w.Mouse.X >= obj.X && w.Mouse.X <= obj.X+obj.Width &&
+			w.Mouse.Y >= obj.Y && w.Mouse.Y <= obj.Y+obj.Height {
+			hovered = append(hovered, obj)
+		}
+	}
+	return hovered
+}
+
+func (w *World) UnhoveredObjects() []*Shape {
+	w.mutex.RLock()
+	defer w.mutex.RUnlock()
+
+	var unhovered []*Shape
+	for _, obj := range w.Objects {
+		if !(w.Mouse.X >= obj.X && w.Mouse.X <= obj.X+obj.Width &&
+			w.Mouse.Y >= obj.Y && w.Mouse.Y <= obj.Y+obj.Height) {
+			unhovered = append(unhovered, obj)
+		}
+	}
+	return unhovered
+}
+
+// Object queries
+func (w *World) GetAllElements() []*Shape {
+	w.mutex.RLock()
+	defer w.mutex.RUnlock()
+
+	result := make([]*Shape, len(w.Objects))
+	copy(result, w.Objects)
+	return result
+}
+
+func (w *World) GetElementsByTagName(tag string) []*Shape {
+	w.mutex.RLock()
+	defer w.mutex.RUnlock()
+
+	var result []*Shape
+	for _, obj := range w.Objects {
+		if obj.Tag == tag {
+			result = append(result, obj)
+		}
+	}
+	return result
+}
+
+func (w *World) GetElementByName(name string) *Shape {
+	w.mutex.RLock()
+	defer w.mutex.RUnlock()
+
+	for _, obj := range w.Objects {
+		if obj.Name == name {
+			return obj
+		}
+	}
+	return nil
+}
+
+func (w *World) GetElementsByName(name string) []*Shape {
+	w.mutex.RLock()
+	defer w.mutex.RUnlock()
+
+	var result []*Shape
+	for _, obj := range w.Objects {
+		if obj.Name == name {
+			result = append(result, obj)
+		}
+	}
+	return result
+}
+
+func (w *World) GetElementsByType(shapeType ShapeType) []*Shape {
+	w.mutex.RLock()
+	defer w.mutex.RUnlock()
+
+	var result []*Shape
+	for _, obj := range w.Objects {
+		if obj.Type == shapeType {
+			result = append(result, obj)
+		}
+	}
+	return result
+}
+
+// State control
+func (w *World) Pause() {
+	w.Paused = true
+}
+
+func (w *World) Resume() {
+	w.Paused = false
+}
+
+func (w *World) GetCursorPosition() Vector2 {
+	return Vector2{X: w.Mouse.X, Y: w.Mouse.Y}
+}
+
+// Input utilities - Thread-safe key checking
+func (w *World) IsKeyPressed(key ebiten.Key) bool {
+	w.keysMutex.RLock()
+	defer w.keysMutex.RUnlock()
+	return w.Keys[key]
+}
+
+func (w *World) OncePressed(key ebiten.Key, callback func()) {
+	// This would need to be implemented with a key state tracker
+	// For now, it's a placeholder
+}
